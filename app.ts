@@ -11,6 +11,7 @@ import {
   infoRefsReceive, infoRefsUploadV0, infoRefsUploadV2,
 } from './src/git/protocol.ts';
 import { decodePktLines } from './src/git/pkt.ts';
+import { handleMcp } from './src/mcp.ts';
 
 /** Read a request body to completion (Content-Length known; the suite always sets it). */
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -230,8 +231,12 @@ export function createApp(): Server {
 
       if (path === '/mcp' && method === 'POST') {
         const body = await readBody(req);
-        const { handleMcp } = await import('./src/mcp.ts');
         await handleMcp({ req, res, body, forge, token, authenticated });
+        return;
+      }
+
+      if (path === '/mcp' && method === 'DELETE') {
+        await handleMcp({ req, res, body: Buffer.alloc(0), forge, token, authenticated });
         return;
       }
 
