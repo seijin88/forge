@@ -122,4 +122,11 @@ export class Forge {
     this.nextIssueNumber.set(key, next + 1);
     return next;
   }
+
+  private commentIdCounter = 1000;
+
+  nextCommentId(): number {
+    this.commentIdCounter += 1;
+    return this.commentIdCounter;
+  }
 }
