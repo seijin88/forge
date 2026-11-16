@@ -12,6 +12,7 @@ import {
 } from './src/git/protocol.ts';
 import { decodePktLines } from './src/git/pkt.ts';
 import { handleMcp } from './src/mcp.ts';
+import { handleGraphQL } from './src/graphql.ts';
 
 /** Read a request body to completion (Content-Length known; the suite always sets it). */
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -224,7 +225,6 @@ export function createApp(): Server {
 
       if (path === '/api/graphql' && method === 'POST') {
         const body = await readBody(req);
-        const { handleGraphQL } = await import('./src/graphql.ts');
         handleGraphQL({ req, res, body, forge, token, authenticated });
         return;
       }
