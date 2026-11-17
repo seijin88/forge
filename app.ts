@@ -31,20 +31,32 @@ const EMPTY_QUERY = new URLSearchParams();
  * The request target, split once: the path and the query. The hot path avoids `new URL` (it
  * allocates a URL object and reparses the whole target); unusual targets (absolute form, dot
  * segments) still go through the URL parser so they normalize the same way.
+ *
+ * The last target is kept: the suite asks for the same paths over and over, and re-splitting
+ * them costs a slice and a string hash per request.
  */
-function parseTarget(req: IncomingMessage): { path: string; query: URLSearchParams } {
+let lastRawTarget = '';
+let targetPath = '/';
+let targetQuery: URLSearchParams = EMPTY_QUERY;
+
+function parseTarget(req: IncomingMessage): void {
   const raw = req.url ?? '/';
-  if (raw === '') return { path: '/', query: EMPTY_QUERY };
+  if (raw === lastRawTarget) return;
+  lastRawTarget = raw;
   const mark = raw.indexOf('?');
   const path = mark === -1 ? raw : raw.slice(0, mark);
   if (path.startsWith('/') && !path.includes('/.')) {
-    return { path, query: mark === -1 ? EMPTY_QUERY : new URLSearchParams(raw.slice(mark + 1)) };
+    targetPath = path;
+    targetQuery = mark === -1 ? EMPTY_QUERY : new URLSearchParams(raw.slice(mark + 1));
+    return;
   }
   try {
     const parsed = new URL(raw, 'http://entry');
-    return { path: parsed.pathname, query: parsed.searchParams };
+    targetPath = parsed.pathname;
+    targetQuery = parsed.searchParams;
   } catch {
-    return { path: '/', query: EMPTY_QUERY };
+    targetPath = '/';
+    targetQuery = EMPTY_QUERY;
   }
 }
 
@@ -52,15 +64,26 @@ function parseTarget(req: IncomingMessage): { path: string; query: URLSearchPara
 function bearerOf(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
-  // "Bearer <token>" (case-insensitive scheme), parsed without a regular expression.
+  // "Bearer <token>" (case-insensitive scheme), parsed without a regular expression and
+  // without slicing the scheme out of the header.
   if (header.length < 7) return null;
-  if (header.charCodeAt(0) !== 66 /* B */ && header.charCodeAt(0) !== 98 /* b */) return null;
-  if (header.slice(0, 6).toLowerCase() !== 'bearer') return null;
+  if (!isBearerScheme(header)) return null;
   let index = 6;
   while (index < header.length && header.charCodeAt(index) === 32) index += 1; // spaces
   if (index >= header.length) return null;
   const token = header.slice(index).trim();
   return token === '' ? null : token;
+}
+
+/** Is the header's scheme "bearer", in any case? */
+function isBearerScheme(header: string): boolean {
+  const lower = (code: number): number => (code >= 65 && code <= 90 ? code + 32 : code);
+  return lower(header.charCodeAt(0)) === 98 /* b */
+    && lower(header.charCodeAt(1)) === 101 /* e */
+    && lower(header.charCodeAt(2)) === 97 /* a */
+    && lower(header.charCodeAt(3)) === 114 /* r */
+    && lower(header.charCodeAt(4)) === 101 /* e */
+    && lower(header.charCodeAt(5)) === 114 /* r */;
 }
 
 /** The token the suite presents; unset outside a trial, where any token is accepted. */
@@ -191,16 +214,20 @@ function dispatchUploadPack(git: GitState, body: Buffer, headerWantsV2: boolean)
   return handleFetchV0(git, body);
 }
 
+/** The debug flag, read once: reading process.env per request is slow. */
+const FORGE_DEBUG = process.env.FORGE_DEBUG === '1';
+
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const forge = new Forge(process.env.MAKEFUN_TRIAL_NOW);
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async (): Promise<void> => {
-      const { path, query } = parseTarget(req);
+      parseTarget(req);
+      const path = targetPath;
+      const query = targetQuery;
       const method = (req.method ?? 'GET').toUpperCase();
       const token = bearerOf(req);
-      const headerWantsV2 = (req.headers['git-protocol'] ?? '').toString().trim() === 'version=2';
 
       // The env's boot check calls this twice: 200 {"ok":true}. No auth.
       if (method === 'GET' && path === '/healthz') {
@@ -212,8 +239,9 @@ export function createApp(): Server {
       const gitParts = path === '/api/v3' || path.startsWith('/api/') || path === '/mcp'
         ? null
         : matchGitPath(path);
-      if (process.env.FORGE_DEBUG === '1') console.error(`[route] ${method} ${path} gitParts=${JSON.stringify(gitParts)}`);
+      if (FORGE_DEBUG) console.error(`[route] ${method} ${path} gitParts=${JSON.stringify(gitParts)}`);
       if (gitParts !== null) {
+        const headerWantsV2 = (req.headers['git-protocol'] ?? '').toString().trim() === 'version=2';
         const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
         handleGit(res, gitParts, query, body, forge, method, headerWantsV2);
         return;

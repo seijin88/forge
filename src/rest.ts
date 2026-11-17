@@ -11,15 +11,15 @@ import { GitState } from './git/protocol.ts';
 import { Forge, VIEWER, type ForgeRepo } from './store.ts';
 
 let requestIdCounter = 0;
-/** Pre-rendered request ids: the counter's hex form never changes once rendered. */
-const REQUEST_IDS: string[] = [];
+/** Pre-rendered request ids, indexed by the counter (the counter's hex form never changes). */
+const REQUEST_IDS: string[] = ['FR-00000000'];
 
 export function requestId(): string {
   requestIdCounter += 1;
   const cached = REQUEST_IDS[requestIdCounter];
   if (cached !== undefined) return cached;
   const rendered = `FR-${requestIdCounter.toString(16).padStart(8, '0')}`;
-  if (REQUEST_IDS.length < 8192) REQUEST_IDS.push(rendered);
+  if (requestIdCounter < 8192) REQUEST_IDS[requestIdCounter] = rendered;
   return rendered;
 }
 
@@ -58,13 +58,21 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
 }
 
 /** Answer with a body that is already serialized (the hot path caches its bytes). */
-export function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': body.length,
-    'x-github-request-id': requestId(),
-    ...headers,
-  });
+export function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer, headers?: Record<string, string>): void {
+  if (headers === undefined) {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': body.length,
+      'x-github-request-id': requestId(),
+    });
+  } else {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': body.length,
+      'x-github-request-id': requestId(),
+      ...headers,
+    });
+  }
   res.end(body);
 }
 
@@ -362,6 +370,109 @@ function countLines(content: Buffer): number {
   return content[content.length - 1] === 0x0a ? lines : lines + 1;
 }
 
+// ---------------------------------------------------------------- route parsing
+
+/** One parsed REST route: the repository and the path below it. */
+interface RepoRoute {
+  owner: string;
+  name: string;
+  suffix: string;
+}
+
+/** One parsed /issues route. */
+interface IssueRoute {
+  number: string | null;
+  comments: boolean;
+}
+
+/** One parsed /pulls route. */
+interface PullRoute {
+  number: string | null;
+  action: string | null;
+}
+
+/**
+ * Parsed routes, cached per path: the suite asks for the same paths thousands of times, and
+ * re-running the patterns costs a match array and three strings each time.
+ */
+const REPO_ROUTE_CACHE = new Map<string, RepoRoute | null>();
+const ISSUE_ROUTE_CACHE = new Map<string, IssueRoute | null>();
+const PULL_ROUTE_CACHE = new Map<string, PullRoute | null>();
+
+/** Are all the characters digits? (the route patterns accept only digits) */
+function isDigits(value: string): boolean {
+  if (value.length === 0) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 48 || code > 57) return false;
+  }
+  return true;
+}
+
+function repoRouteOf(path: string): RepoRoute | null {
+  const cached = REPO_ROUTE_CACHE.get(path);
+  if (cached !== undefined) return cached;
+  let route: RepoRoute | null = null;
+  if (path.startsWith('/repos/')) {
+    const rest = path.slice('/repos/'.length);
+    const first = rest.indexOf('/');
+    const owner = first === -1 ? rest : rest.slice(0, first);
+    const after = first === -1 ? '' : rest.slice(first + 1);
+    const second = after.indexOf('/');
+    const name = second === -1 ? after : after.slice(0, second);
+    let suffix = second === -1 ? '' : after.slice(second);
+    if (suffix === '/') suffix = '';
+    if (owner !== '' && name !== '') route = { owner, name, suffix };
+  }
+  if (REPO_ROUTE_CACHE.size >= 1024) REPO_ROUTE_CACHE.clear();
+  REPO_ROUTE_CACHE.set(path, route);
+  return route;
+}
+
+function issueRouteOf(suffix: string): IssueRoute | null {
+  const cached = ISSUE_ROUTE_CACHE.get(suffix);
+  if (cached !== undefined) return cached;
+  let route: IssueRoute | null = null;
+  if (suffix === '/issues') {
+    route = { number: null, comments: false };
+  } else if (suffix.startsWith('/issues/')) {
+    const rest = suffix.slice('/issues/'.length);
+    if (rest.endsWith('/comments')) {
+      const number = rest.slice(0, rest.length - '/comments'.length);
+      if (isDigits(number)) route = { number, comments: true };
+    } else if (isDigits(rest)) {
+      route = { number: rest, comments: false };
+    }
+  }
+  if (ISSUE_ROUTE_CACHE.size >= 1024) ISSUE_ROUTE_CACHE.clear();
+  ISSUE_ROUTE_CACHE.set(suffix, route);
+  return route;
+}
+
+function pullRouteOf(suffix: string): PullRoute | null {
+  const cached = PULL_ROUTE_CACHE.get(suffix);
+  if (cached !== undefined) return cached;
+  let route: PullRoute | null = null;
+  if (suffix === '/pulls') {
+    route = { number: null, action: null };
+  } else if (suffix.startsWith('/pulls/')) {
+    const rest = suffix.slice('/pulls/'.length);
+    const slash = rest.indexOf('/');
+    const number = slash === -1 ? rest : rest.slice(0, slash);
+    if (isDigits(number)) {
+      let action: string | null = null;
+      if (slash !== -1) {
+        const tail = rest.slice(slash + 1);
+        if (tail === 'files' || tail === 'merge') action = tail;
+      }
+      route = { number, action };
+    }
+  }
+  if (PULL_ROUTE_CACHE.size >= 1024) PULL_ROUTE_CACHE.clear();
+  PULL_ROUTE_CACHE.set(suffix, route);
+  return route;
+}
+
 // ---------------------------------------------------------------- the dispatcher
 
 export function handleRest(request: RestRequest, res: ServerResponse): void {
@@ -397,11 +508,9 @@ export function handleRest(request: RestRequest, res: ServerResponse): void {
     return;
   }
 
-  const repoMatch = /^\/repos\/([^/]+)\/([^/]+)(\/.*)?$/.exec(path);
-  if (repoMatch !== null) {
-    const [, owner, name, suffixRaw] = repoMatch as unknown as [string, string, string, string | undefined];
-    const suffix = suffixRaw === undefined || suffixRaw === '/' ? '' : suffixRaw;
-    handleRepoRoutes(request, res, owner, name, suffix);
+  const route = repoRouteOf(path);
+  if (route !== null) {
+    handleRepoRoutes(request, res, route.owner, route.name, route.suffix);
     return;
   }
 
@@ -561,16 +670,16 @@ function handleRepoRoutes(request: RestRequest, res: ServerResponse, owner: stri
   }
 
   // ---- /issues and /issues/{n}/...
-  const issuesMatch = /^\/issues(?:\/(\d+)(\/comments)?)?$/.exec(suffix);
-  if (issuesMatch !== null) {
-    handleIssues(request, res, repo, issuesMatch[1] ?? null, issuesMatch[2] === '/comments');
+  const issueRoute = issueRouteOf(suffix);
+  if (issueRoute !== null) {
+    handleIssues(request, res, repo, issueRoute.number, issueRoute.comments);
     return;
   }
 
   // ---- /pulls and /pulls/{n}/...
-  const pullsMatch = /^\/pulls(?:\/(\d+)(\/(files|merge))?)?$/.exec(suffix);
-  if (pullsMatch !== null) {
-    handlePulls(request, res, repo, pullsMatch[1] ?? null, pullsMatch[3] ?? null);
+  const pullRoute = pullRouteOf(suffix);
+  if (pullRoute !== null) {
+    handlePulls(request, res, repo, pullRoute.number, pullRoute.action);
     return;
   }
 

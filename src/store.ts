@@ -92,6 +92,10 @@ export class ForgeRepo {
 export class Forge {
   /** Keyed by `${owner}/${name}` lowercased only by exact name (GitHub names are case-insensitive-ish; suite uses one case). */
   private readonly repos = new Map<string, ForgeRepo>();
+  /** The last repository looked up: the hot path asks for the same repository over and over. */
+  private lastOwner = '';
+  private lastName = '';
+  private lastRepo: ForgeRepo | null = null;
   /** Deterministic clock: starts at the trial's opening time, +1s per state change. */
   private clockMs: number;
   private nextRepoId = 5000;
@@ -112,19 +116,36 @@ export class Forge {
   }
 
   getRepo(owner: string, name: string): ForgeRepo | null {
-    return this.repos.get(`${owner}/${name}`) ?? null;
+    if (owner === this.lastOwner && name === this.lastName) return this.lastRepo;
+    const repo = this.repos.get(`${owner}/${name}`) ?? null;
+    this.lastOwner = owner;
+    this.lastName = name;
+    this.lastRepo = repo;
+    return repo;
   }
 
   createRepo(owner: string, name: string, description: string, isPrivate: boolean, autoInit: boolean): ForgeRepo {
     const repo = new ForgeRepo(name, owner, description, isPrivate, autoInit, this.nowMs());
     this.repos.set(`${owner}/${name}`, repo);
     this.nextIssueNumber.set(`${owner}/${name}`, 1);
+    // A memoized miss for this name would now be stale.
+    if (owner === this.lastOwner && name === this.lastName) {
+      this.lastOwner = '';
+      this.lastName = '';
+      this.lastRepo = null;
+    }
     void this.nextRepoId;
     return repo;
   }
 
   deleteRepo(owner: string, name: string): void {
     this.repos.delete(`${owner}/${name}`);
+    // The lookup memo must not hand out the repository that just went away.
+    if (owner === this.lastOwner && name === this.lastName) {
+      this.lastOwner = '';
+      this.lastName = '';
+      this.lastRepo = null;
+    }
   }
 
   listRepos(owner: string): ForgeRepo[] {

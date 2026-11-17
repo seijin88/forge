@@ -379,14 +379,18 @@ function finishValue(context: ExecContext, node: FieldNode, resolved: unknown, v
 
 // ---------------------------------------------------------------- object builders
 
-function issueGlobalId(issue: ForgeRepo['issues'][number]): string {
-  return encodeId('Issue', issue.number);
+/**
+ * An issue's global id. It names the repository too: issue numbers only count inside one
+ * repository, so a bare number would not identify an issue across the account's repositories.
+ */
+function issueGlobalId(repo: ForgeRepo, issue: ForgeRepo['issues'][number]): string {
+  return encodeId('Issue', `${repo.owner}/${repo.name}#${issue.number}`);
 }
 
 function issueNode(repo: ForgeRepo, issue: ForgeRepo['issues'][number]): Record<string, unknown> {
   return {
     __typename: 'Issue',
-    id: issueGlobalId(issue),
+    id: issueGlobalId(repo, issue),
     number: issue.number,
     title: issue.title,
     state: issue.state === 'open' ? 'OPEN' : 'CLOSED',
@@ -476,7 +480,7 @@ function repositoryNode(forge: Forge, repo: ForgeRepo): Record<string, unknown> 
     issue: (args: Record<string, unknown>) => {
       const number = Number(args.number);
       const issue = repo.issue(number);
-      return issue === undefined ? null : issueNode(repo, issue);
+      return issue === null ? null : issueNode(repo, issue);
     },
     issues: (args: Record<string, unknown>) => {
       let list = repo.issues.slice();
@@ -709,10 +713,25 @@ function resolveMutationField(context: ExecContext, node: FieldNode, bound: Map<
 function findIssueByGlobalId(forge: Forge, globalId: string): { repo: ForgeRepo; issue: ForgeRepo['issues'][number] } | null {
   const decoded = decodeId(globalId);
   if (decoded === null || decoded.type !== 'Issue') return null;
-  const number = Number.parseInt(decoded.id, 10);
+  const payload = decoded.id;
+  const hash = payload.lastIndexOf('#');
+  if (hash !== -1) {
+    // The id names its repository: "owner/name#number".
+    const slash = payload.lastIndexOf('/');
+    if (slash === -1 || slash > hash) return null;
+    const owner = payload.slice(0, slash);
+    const name = payload.slice(slash + 1, hash);
+    const number = Number.parseInt(payload.slice(hash + 1), 10);
+    const repo = forge.getRepo(owner, name);
+    if (repo === null) return null;
+    const issue = repo.issue(number);
+    return issue === null ? null : { repo, issue };
+  }
+  // An id without its repository (an older id): the first repository that has that number.
+  const number = Number.parseInt(payload, 10);
   for (const repo of forge.listRepos(VIEWER.login)) {
     const issue = repo.issue(number);
-    if (issue !== undefined) return { repo, issue };
+    if (issue !== null) return { repo, issue };
   }
   return null;
 }
