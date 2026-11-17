@@ -24,19 +24,27 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
+/** The query string of a request that carries none (shared; it is never mutated). */
+const EMPTY_QUERY = new URLSearchParams();
 
-function queryOf(req: IncomingMessage): URLSearchParams {
+/**
+ * The request target, split once: the path and the query. The hot path avoids `new URL` (it
+ * allocates a URL object and reparses the whole target); unusual targets (absolute form, dot
+ * segments) still go through the URL parser so they normalize the same way.
+ */
+function parseTarget(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const raw = req.url ?? '/';
+  if (raw === '') return { path: '/', query: EMPTY_QUERY };
+  const mark = raw.indexOf('?');
+  const path = mark === -1 ? raw : raw.slice(0, mark);
+  if (path.startsWith('/') && !path.includes('/.')) {
+    return { path, query: mark === -1 ? EMPTY_QUERY : new URLSearchParams(raw.slice(mark + 1)) };
+  }
   try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
+    const parsed = new URL(raw, 'http://entry');
+    return { path: parsed.pathname, query: parsed.searchParams };
   } catch {
-    return new URLSearchParams();
+    return { path: '/', query: EMPTY_QUERY };
   }
 }
 
@@ -44,9 +52,14 @@ function queryOf(req: IncomingMessage): URLSearchParams {
 function bearerOf(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  if (match === null) return null;
-  const token = match[1]!.trim();
+  // "Bearer <token>" (case-insensitive scheme), parsed without a regular expression.
+  if (header.length < 7) return null;
+  if (header.charCodeAt(0) !== 66 /* B */ && header.charCodeAt(0) !== 98 /* b */) return null;
+  if (header.slice(0, 6).toLowerCase() !== 'bearer') return null;
+  let index = 6;
+  while (index < header.length && header.charCodeAt(index) === 32) index += 1; // spaces
+  if (index >= header.length) return null;
+  const token = header.slice(index).trim();
   return token === '' ? null : token;
 }
 
@@ -184,9 +197,8 @@ export function createApp(): Server {
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async (): Promise<void> => {
-      const path = pathOf(req);
+      const { path, query } = parseTarget(req);
       const method = (req.method ?? 'GET').toUpperCase();
-      const query = queryOf(req);
       const token = bearerOf(req);
       const headerWantsV2 = (req.headers['git-protocol'] ?? '').toString().trim() === 'version=2';
 
@@ -196,8 +208,10 @@ export function createApp(): Server {
         return;
       }
 
-      // The git smart-HTTP surface.
-      const gitParts = matchGitPath(path);
+      // The git smart-HTTP surface. API paths never are one, so they skip the pattern.
+      const gitParts = path === '/api/v3' || path.startsWith('/api/') || path === '/mcp'
+        ? null
+        : matchGitPath(path);
       if (process.env.FORGE_DEBUG === '1') console.error(`[route] ${method} ${path} gitParts=${JSON.stringify(gitParts)}`);
       if (gitParts !== null) {
         const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
@@ -262,7 +276,15 @@ export function createApp(): Server {
   });
 }
 
+/** The origin of a request, cached per Host header (the string never changes during a trial). */
+let lastHost = '';
+let lastOrigin = '';
+
 function originOf(req: IncomingMessage): string {
   const host = req.headers.host ?? '127.0.0.1';
-  return `http://${host}`;
+  if (host !== lastHost) {
+    lastHost = host;
+    lastOrigin = `http://${host}`;
+  }
+  return lastOrigin;
 }

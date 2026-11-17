@@ -23,6 +23,8 @@ export class GitState {
   /** Bumped on every ref/object change; keys the pack cache. */
   version = 0;
   private readonly packCache = new Map<string, Buffer>();
+  /** Cached whole protocol replies (advertisements, fetch responses) for one store version. */
+  private readonly responseCache = new Map<string, Buffer>();
 
   hasObject(oid: string): boolean {
     return this.objects.has(oid);
@@ -72,6 +74,16 @@ export class GitState {
   putPack(key: string, pack: Buffer): void {
     if (this.packCache.size >= 6) this.packCache.clear();
     this.packCache.set(key, pack);
+  }
+
+  /** A cached whole reply for this exact request against this store version. */
+  cachedResponse(key: string): Buffer | null {
+    return this.responseCache.get(key) ?? null;
+  }
+
+  putResponse(key: string, response: Buffer): void {
+    if (this.responseCache.size >= 24) this.responseCache.clear();
+    this.responseCache.set(key, response);
   }
 }
 
@@ -293,15 +305,18 @@ export function sidebandMux(band: number, data: Buffer): Buffer {
 
 // ---------------------------------------------------------------- advertisements
 
+/** The v2 upload-pack advertisement never changes: one buffer for the whole trial. */
+const UPLOAD_V2_ADVERTISEMENT = Buffer.concat([
+  encodePktLine('version 2\n'),
+  encodePktLine(`${AGENT}\n`),
+  encodePktLine('ls-refs=unborn\n'),
+  encodePktLine('fetch=shallow\n'),
+  encodePktLine('object-format=sha1\n'),
+  flushPkt(),
+]);
+
 export function infoRefsUploadV2(): Buffer {
-  return Buffer.concat([
-    encodePktLine('version 2\n'),
-    encodePktLine(`${AGENT}\n`),
-    encodePktLine('ls-refs=unborn\n'),
-    encodePktLine('fetch=shallow\n'),
-    encodePktLine('object-format=sha1\n'),
-    flushPkt(),
-  ]);
+  return UPLOAD_V2_ADVERTISEMENT;
 }
 
 function refListing(git: GitState): Array<{ name: string; oid: string; peeled: string | null }> {
@@ -317,6 +332,9 @@ function refListing(git: GitState): Array<{ name: string; oid: string; peeled: s
 }
 
 export function infoRefsUploadV0(git: GitState): Buffer {
+  const key = `adv-up-v0|${git.version}`;
+  const cached = git.cachedResponse(key);
+  if (cached !== null) return cached;
   const caps = ['side-band-64k', 'thin-pack', 'no-progress', 'ofs-delta', 'shallow', `symref=HEAD:${git.headTarget}`, AGENT];
   const parts: Buffer[] = [encodePktLine('# service=git-upload-pack\n'), flushPkt()];
   const refs = refListing(git);
@@ -330,10 +348,15 @@ export function infoRefsUploadV0(git: GitState): Buffer {
     });
   }
   parts.push(flushPkt());
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  git.putResponse(key, body);
+  return body;
 }
 
 export function infoRefsReceive(git: GitState): Buffer {
+  const key = `adv-rx|${git.version}`;
+  const cached = git.cachedResponse(key);
+  if (cached !== null) return cached;
   const caps = ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', AGENT];
   const parts: Buffer[] = [encodePktLine('# service=git-receive-pack\n'), flushPkt()];
   const refs = refListing(git);
@@ -346,7 +369,9 @@ export function infoRefsReceive(git: GitState): Buffer {
     });
   }
   parts.push(flushPkt());
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  git.putResponse(key, body);
+  return body;
 }
 
 // ---------------------------------------------------------------- ls-refs (v2)
@@ -421,6 +446,9 @@ export function handleFetchV2(git: GitState, argLines: readonly string[]): Buffe
     else if (line.startsWith('shallow ')) request.shallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) request.depth = Number.parseInt(line.slice(7).trim(), 10);
   }
+  const replyKey = `fetch-v2|${git.version}|d${request.depth === null ? 'x' : request.depth}|w${request.wants.join(',')}|h${request.haves.join(',')}|s${request.shallow.join(',')}`;
+  const cachedReply = git.cachedResponse(replyKey);
+  if (cachedReply !== null) return cachedReply;
   const clientBoundaries = new Set(request.shallow);
   const possessed = walkPossessed(git, request.haves, clientBoundaries);
   const { send, newBoundaries, unshallowed } = walkClosure(git, request.wants, request.depth, clientBoundaries, possessed);
@@ -439,7 +467,9 @@ export function handleFetchV2(git: GitState, argLines: readonly string[]): Buffe
   const packKey = `v2|d${request.depth === null ? 'x' : request.depth}|${[...request.wants].sort().join(',')}|${[...request.shallow].sort().join(',')}|${git.version}`;
   if (send.size === 0 && newBoundaries.length === 0 && unshallowed.length === 0) {
     git.putPack(packKey, Buffer.alloc(0));
-    return Buffer.concat(parts); // acknowledgments only: nothing to send
+    const empty = Buffer.concat(parts); // acknowledgments only: nothing to send
+    git.putResponse(replyKey, empty);
+    return empty;
   }
   if (newBoundaries.length > 0 || unshallowed.length > 0) {
     parts.push(encodePktLine('shallow-info\n'));
@@ -451,7 +481,9 @@ export function handleFetchV2(git: GitState, argLines: readonly string[]): Buffe
   const pack = cachedPackFor(git, packKey, send);
   parts.push(sidebandMux(1, pack));
   parts.push(flushPkt());
-  return Buffer.concat(parts);
+  const reply = Buffer.concat(parts);
+  git.putResponse(replyKey, reply);
+  return reply;
 }
 
 export function handleFetchV0(git: GitState, body: Buffer): Buffer {
@@ -470,6 +502,9 @@ export function handleFetchV0(git: GitState, body: Buffer): Buffer {
       // 'done' ends negotiation; anything else is ignored
     }
   }
+  const replyKey = `fetch-v0|${git.version}|d${request.depth === null ? 'x' : request.depth}|w${request.wants.join(',')}|h${request.haves.join(',')}|s${request.shallow.join(',')}`;
+  const cachedReply = git.cachedResponse(replyKey);
+  if (cachedReply !== null) return cachedReply;
   const clientBoundaries = new Set(request.shallow);
   const possessed = walkPossessed(git, request.haves, clientBoundaries);
   const { send, newBoundaries, unshallowed } = walkClosure(git, request.wants, request.depth, clientBoundaries, possessed);
@@ -484,7 +519,9 @@ export function handleFetchV0(git: GitState, body: Buffer): Buffer {
     const packKey = `v0|d${request.depth === null ? 'x' : request.depth}|${[...request.wants].sort().join(',')}|${[...request.shallow].sort().join(',')}|${git.version}`;
     parts.push(sidebandMux(1, cachedPackFor(git, packKey, send)));
   }
-  return Buffer.concat(parts);
+  const reply = Buffer.concat(parts);
+  git.putResponse(replyKey, reply);
+  return reply;
 }
 
 function cachedPackFor(git: GitState, key: string, send: ReadonlySet<string>): Buffer {

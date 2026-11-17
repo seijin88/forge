@@ -299,8 +299,9 @@ function toolCreateIssue(forge: Forge, args: Record<string, unknown>): Record<st
     closedAtMs: null,
     user: VIEWER.login,
     comments: [] as ForgeRepo['issues'][number]['comments'],
+    version: 1,
   };
-  repo.issues.push(issue);
+  repo.addIssue(issue);
   repo.updatedAtMs = now;
   return { id: 100000 + issue.number, number: issue.number, title: issue.title, body: issue.body, state: 'open' };
 }

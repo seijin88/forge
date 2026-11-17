@@ -2,6 +2,12 @@
 // number of input bytes consumed is known: packfiles hold many zlib streams back to back and
 // node:zlib's sync helpers cannot say where one stream ends. Only the decode side is custom;
 // encoding stays on node:zlib (deflateSync), which is the performance-critical direction.
+//
+// The decoder below is the fallback: node:zlib's inflateSync reports the bytes it consumed when
+// it is called with the `info` option, so the fast path uses zlib and this code only runs for
+// streams zlib refuses.
+
+import { inflateSync } from 'node:zlib';
 
 export interface InflateResult {
   data: Buffer;
@@ -209,12 +215,22 @@ function inflateRaw(reader: BitReader, output: number[]): boolean {
 /**
  * Inflate the first zlib (RFC 1950) stream found at `input[offset..]`.
  * Returns the data and how many input bytes the whole stream took, or null when malformed.
+ *
+ * node:zlib does the work: `inflateSync` with the `info` option reports how many input bytes it
+ * consumed, which is exactly what a packfile needs (many zlib streams sit back to back). The
+ * hand-written decoder below stays as the fallback for streams zlib refuses (a bad adler32, say),
+ * so the old tolerance for odd-but-readable input is unchanged.
  */
 export function inflateZlibAt(input: Buffer, offset: number, expectedSize?: number): InflateResult | null {
-  // zlib header: CMF/FLG two bytes (CM must be 8); we do not enforce the check bits strictly.
   if (offset + 2 > input.length) return null;
   const cmf = input[offset]!;
   if ((cmf & 0x0f) !== 8) return null;
+  const native = inflateNative(input, offset);
+  if (native !== null) {
+    if (expectedSize !== undefined && native.data.length !== expectedSize) return null;
+    return native;
+  }
+  // Fallback: the hand-written decoder.
   const reader = new BitReader(input, offset + 2, input.length);
   const output: number[] = [];
   const ok = inflateRaw(reader, output);
@@ -223,11 +239,21 @@ export function inflateZlibAt(input: Buffer, offset: number, expectedSize?: numb
   const consumedRaw = reader.pos;
   const consumed = 2 + consumedRaw + 4; // header + deflate + adler32
   if (offset + consumed > input.length) return null;
-  const data = expectedSize !== undefined && output.length === expectedSize && expectedSize > 0 && output.length < 1 << 21
-    ? Buffer.from(output)
-    : Buffer.from(output);
+  const data = Buffer.from(output);
   if (expectedSize !== undefined && data.length !== expectedSize) return null;
   return { data, consumed };
+}
+
+/** The zlib stream at `offset`, decoded by node:zlib; null when zlib refuses it. */
+function inflateNative(input: Buffer, offset: number): InflateResult | null {
+  try {
+    const result = inflateSync(input.subarray(offset), { info: true });
+    const consumed = result.engine.bytesWritten;
+    if (!Number.isFinite(consumed) || consumed <= 0 || offset + consumed > input.length) return null;
+    return { data: result.buffer, consumed };
+  } catch {
+    return null;
+  }
 }
 
 /** Convenience: inflate at `offset` and throw on failure. */

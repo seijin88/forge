@@ -11,10 +11,39 @@ import { GitState } from './git/protocol.ts';
 import { Forge, VIEWER, type ForgeRepo } from './store.ts';
 
 let requestIdCounter = 0;
+/** Pre-rendered request ids: the counter's hex form never changes once rendered. */
+const REQUEST_IDS: string[] = [];
 
 export function requestId(): string {
   requestIdCounter += 1;
-  return `FR-${requestIdCounter.toString(16).padStart(8, '0')}`;
+  const cached = REQUEST_IDS[requestIdCounter];
+  if (cached !== undefined) return cached;
+  const rendered = `FR-${requestIdCounter.toString(16).padStart(8, '0')}`;
+  if (REQUEST_IDS.length < 8192) REQUEST_IDS.push(rendered);
+  return rendered;
+}
+
+/** ISO timestamps, cached: the same millisecond recurs across many responses. */
+const ISO_CACHE = new Map<number, string>();
+
+function iso(ms: number): string {
+  const cached = ISO_CACHE.get(ms);
+  if (cached !== undefined) return cached;
+  const text = new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  if (ISO_CACHE.size >= 4096) ISO_CACHE.clear();
+  ISO_CACHE.set(ms, text);
+  return text;
+}
+
+/** node_ids, cached per login: the base64 of a login never changes. */
+const NODE_ID_CACHE = new Map<string, string>();
+
+function nodeIdOf(login: string): string {
+  const cached = NODE_ID_CACHE.get(login);
+  if (cached !== undefined) return cached;
+  const nodeId = `U_${Buffer.from(login).toString('base64url')}`;
+  NODE_ID_CACHE.set(login, nodeId);
+  return nodeId;
 }
 
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -26,6 +55,17 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
     ...headers,
   });
   res.end(text);
+}
+
+/** Answer with a body that is already serialized (the hot path caches its bytes). */
+export function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': body.length,
+    'x-github-request-id': requestId(),
+    ...headers,
+  });
+  res.end(body);
 }
 
 export interface RestRequest {
@@ -54,7 +94,7 @@ const badRequest = (res: ServerResponse, message = 'Problems parsing JSON'): voi
 // ---------------------------------------------------------------- shapes
 
 function userJson(login: string, id: number): Record<string, unknown> {
-  return { login, id, node_id: `U_${Buffer.from(login).toString('base64url')}`, type: 'User', site_admin: false };
+  return { login, id, node_id: nodeIdOf(login), type: 'User', site_admin: false };
 }
 
 function repoJson(repo: ForgeRepo, baseUrl: string): Record<string, unknown> {
@@ -108,6 +148,22 @@ function issueJson(repo: ForgeRepo, issue: ForgeRepo['issues'][number], baseUrl:
   };
 }
 
+/** The cached bytes of one issue's JSON, kept on the issue itself (the hot GET path). */
+interface IssueJsonCache {
+  baseUrl: string;
+  version: number;
+  buffer: Buffer;
+}
+
+/** One issue's JSON, serialized once per (issue version, origin) and then reused byte for byte. */
+function issueJsonBuffer(repo: ForgeRepo, issue: ForgeRepo['issues'][number], baseUrl: string): Buffer {
+  const cached = (issue as ForgeRepo['issues'][number] & { json?: IssueJsonCache }).json;
+  if (cached !== undefined && cached.version === issue.version && cached.baseUrl === baseUrl) return cached.buffer;
+  const buffer = Buffer.from(`${JSON.stringify(issueJson(repo, issue, baseUrl))}\n`, 'utf8');
+  (issue as ForgeRepo['issues'][number] & { json?: IssueJsonCache }).json = { baseUrl, version: issue.version, buffer };
+  return buffer;
+}
+
 function pullJson(repo: ForgeRepo, pull: ForgeRepo['pulls'][number], baseUrl: string): Record<string, unknown> {
   return {
     id: 200000 + pull.number,
@@ -131,10 +187,6 @@ function pullJson(repo: ForgeRepo, pull: ForgeRepo['pulls'][number], baseUrl: st
     url: `${baseUrl}/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull.number}`,
     html_url: `${baseUrl}/${repo.owner}/${repo.name}/pull/${pull.number}`,
   };
-}
-
-function iso(ms: number): string {
-  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
 function hashString(value: string): number {
@@ -667,8 +719,9 @@ function handleIssues(request: RestRequest, res: ServerResponse, repo: ForgeRepo
         closedAtMs: null,
         user: VIEWER.login,
         comments: [] as ForgeRepo['issues'][number]['comments'],
+        version: 1,
       };
-      repo.issues.push(issue);
+      repo.addIssue(issue);
       repo.updatedAtMs = now;
       sendJson(res, 201, issueJson(repo, issue, baseUrl));
       return;
@@ -695,7 +748,7 @@ function handleIssues(request: RestRequest, res: ServerResponse, repo: ForgeRepo
   }
 
   const number = Number.parseInt(numberRaw, 10);
-  const issue = repo.issues.find((candidate) => candidate.number === number) ?? null;
+  const issue = repo.issue(number);
 
   if (comments) {
     if (issue === null) { notFound(res); return; }
@@ -706,6 +759,7 @@ function handleIssues(request: RestRequest, res: ServerResponse, repo: ForgeRepo
       const comment = { id: forge.nextCommentId(), body: commentBody, user: VIEWER.login, createdAtMs: forge.nowMs() };
       issue.comments.push(comment);
       issue.updatedAtMs = comment.createdAtMs;
+      issue.version += 1;
       sendJson(res, 201, { id: comment.id, body: comment.body, user: userJson(VIEWER.login, VIEWER.id), created_at: iso(comment.createdAtMs) });
       return;
     }
@@ -724,7 +778,7 @@ function handleIssues(request: RestRequest, res: ServerResponse, repo: ForgeRepo
 
   if (issue === null) { notFound(res); return; }
   if (method === 'GET') {
-    sendJson(res, 200, issueJson(repo, issue, baseUrl));
+    sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue, baseUrl));
     return;
   }
   if (method === 'PATCH') {
@@ -737,6 +791,7 @@ function handleIssues(request: RestRequest, res: ServerResponse, repo: ForgeRepo
     if (typeof body.title === 'string') issue.title = body.title;
     if (typeof body.body === 'string') issue.body = body.body;
     issue.updatedAtMs = forge.nowMs();
+    issue.version += 1;
     sendJson(res, 200, issueJson(repo, issue, baseUrl));
     return;
   }

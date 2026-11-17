@@ -475,7 +475,7 @@ function repositoryNode(forge: Forge, repo: ForgeRepo): Record<string, unknown> 
     hasIssuesEnabled: true,
     issue: (args: Record<string, unknown>) => {
       const number = Number(args.number);
-      const issue = repo.issues.find((candidate) => candidate.number === number);
+      const issue = repo.issue(number);
       return issue === undefined ? null : issueNode(repo, issue);
     },
     issues: (args: Record<string, unknown>) => {
@@ -613,8 +613,9 @@ function resolveMutationField(context: ExecContext, node: FieldNode, bound: Map<
       closedAtMs: null,
       user: VIEWER.login,
       comments: [] as ForgeRepo['issues'][number]['comments'],
+      version: 1,
     };
-    repo.issues.push(issue);
+    repo.addIssue(issue);
     repo.updatedAtMs = now;
     return { __typename: 'CreateIssuePayload', issue: issueNode(repo, issue) };
   }
@@ -625,6 +626,7 @@ function resolveMutationField(context: ExecContext, node: FieldNode, bound: Map<
     issue.state = 'closed';
     issue.closedAtMs = forge.nowMs();
     issue.updatedAtMs = issue.closedAtMs;
+    issue.version += 1;
     return { __typename: 'CloseIssuePayload', issue: issueNode(repo, issue) };
   }
   if (node.name === 'createPullRequest') {
@@ -694,6 +696,7 @@ function resolveMutationField(context: ExecContext, node: FieldNode, bound: Map<
     const body = String(input.body ?? '');
     const commentId = forge.nextCommentId();
     issue.comments.push({ id: commentId, body, user: VIEWER.login, createdAtMs: forge.nowMs() });
+    issue.version += 1;
     return {
       __typename: 'AddCommentPayload',
       commentEdge: { node: { __typename: 'Comment', id: encodeId('Comment', commentId), body } },
@@ -708,7 +711,7 @@ function findIssueByGlobalId(forge: Forge, globalId: string): { repo: ForgeRepo;
   if (decoded === null || decoded.type !== 'Issue') return null;
   const number = Number.parseInt(decoded.id, 10);
   for (const repo of forge.listRepos(VIEWER.login)) {
-    const issue = repo.issues.find((candidate) => candidate.number === number);
+    const issue = repo.issue(number);
     if (issue !== undefined) return { repo, issue };
   }
   return null;

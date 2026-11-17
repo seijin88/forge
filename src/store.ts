@@ -20,6 +20,8 @@ export interface Issue {
   closedAtMs: number | null;
   user: string;
   comments: Array<{ id: number; body: string; user: string; createdAtMs: number }>;
+  /** Bumped on every change to the issue; the REST surface caches its JSON against it. */
+  version: number;
 }
 
 export interface PullRequest {
@@ -53,6 +55,8 @@ export class ForgeRepo {
   readonly owner: string;
   readonly git = new GitState();
   readonly issues: Issue[] = [];
+  /** Issue numbers -> issue; the array above keeps creation order, this one answers lookups in O(1). */
+  readonly issuesByNumber = new Map<number, Issue>();
   readonly pulls: PullRequest[] = [];
   readonly labels = new Set<string>();
   readonly contents = new Map<string, ContentsEntry>();
@@ -71,6 +75,17 @@ export class ForgeRepo {
     this.autoInit = autoInit;
     this.createdAtMs = createdAtMs;
     this.updatedAtMs = createdAtMs;
+  }
+
+  /** Add an issue to both indexes. */
+  addIssue(issue: Issue): void {
+    this.issues.push(issue);
+    this.issuesByNumber.set(issue.number, issue);
+  }
+
+  /** The issue with that number, or null. */
+  issue(number: number): Issue | null {
+    return this.issuesByNumber.get(number) ?? null;
   }
 }
 
