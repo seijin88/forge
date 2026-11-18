@@ -2,8 +2,10 @@
 // REST v3, GraphQL v4 and MCP. app.ts is the file that grows; main.ts keeps the entry<->env
 // lifecycle and must stay as the starter ships it.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
 import { Forge } from './src/store.ts';
+import { createForgeServer } from './src/raw-server.ts';
+import type { ForgeRequest, ForgeResponse } from './src/http-types.ts';
 import { handleRest, requestId, sendJson } from './src/rest.ts';
 import {
   GitState,
@@ -13,16 +15,6 @@ import {
 import { decodePktLines } from './src/git/pkt.ts';
 import { handleMcp } from './src/mcp.ts';
 import { handleGraphQL } from './src/graphql.ts';
-
-/** Read a request body to completion (Content-Length known; the suite always sets it). */
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
 
 /** The query string of a request that carries none (shared; it is never mutated). */
 const EMPTY_QUERY = new URLSearchParams();
@@ -39,7 +31,7 @@ let lastRawTarget = '';
 let targetPath = '/';
 let targetQuery: URLSearchParams = EMPTY_QUERY;
 
-function parseTarget(req: IncomingMessage): void {
+function parseTarget(req: ForgeRequest): void {
   const raw = req.url ?? '/';
   if (raw === lastRawTarget) return;
   lastRawTarget = raw;
@@ -61,7 +53,7 @@ function parseTarget(req: IncomingMessage): void {
 }
 
 /** The bearer token, or null when absent. An empty string counts as absent. */
-function bearerOf(req: IncomingMessage): string | null {
+function bearerOf(req: ForgeRequest): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
   // "Bearer <token>" (case-insensitive scheme), parsed without a regular expression and
@@ -104,7 +96,7 @@ export function matchGitPath(path: string): { owner: string; repo: string; endpo
 
 /** Dispatch one git smart-HTTP request (`body` is the raw request body; empty for GETs). */
 function handleGit(
-  res: ServerResponse,
+  res: ForgeResponse,
   parts: { owner: string; repo: string; endpoint: string },
   query: URLSearchParams,
   body: Buffer,
@@ -221,7 +213,7 @@ const FORGE_DEBUG = process.env.FORGE_DEBUG === '1';
 export function createApp(): Server {
   const forge = new Forge(process.env.MAKEFUN_TRIAL_NOW);
 
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  return createForgeServer((req: ForgeRequest, res: ForgeResponse): void => {
     void (async (): Promise<void> => {
       parseTarget(req);
       const path = targetPath;
@@ -242,7 +234,7 @@ export function createApp(): Server {
       if (FORGE_DEBUG) console.error(`[route] ${method} ${path} gitParts=${JSON.stringify(gitParts)}`);
       if (gitParts !== null) {
         const headerWantsV2 = (req.headers['git-protocol'] ?? '').toString().trim() === 'version=2';
-        const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
+        const body = method === 'POST' ? req.body : Buffer.alloc(0);
         handleGit(res, gitParts, query, body, forge, method, headerWantsV2);
         return;
       }
@@ -266,14 +258,12 @@ export function createApp(): Server {
       }
 
       if (path === '/api/graphql' && method === 'POST') {
-        const body = await readBody(req);
-        handleGraphQL({ req, res, body, forge, token, authenticated });
+        handleGraphQL({ req, res, body: req.body, forge, token, authenticated });
         return;
       }
 
       if (path === '/mcp' && method === 'POST') {
-        const body = await readBody(req);
-        await handleMcp({ req, res, body, forge, token, authenticated });
+        await handleMcp({ req, res, body: req.body, forge, token, authenticated });
         return;
       }
 
@@ -283,9 +273,8 @@ export function createApp(): Server {
       }
 
       if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-        const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+        const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : req.body;
         const restPath = path === '/api/v3/' ? '' : path.slice('/api/v3'.length);
-        (req as IncomingMessage & { rawBody?: Buffer }).rawBody = body;
         handleRest({ req, method, path: restPath, query, forge, token: authenticated ? token : null, baseUrl: originOf(req), rawBody: body }, res);
         return;
       }
@@ -308,7 +297,7 @@ export function createApp(): Server {
 let lastHost = '';
 let lastOrigin = '';
 
-function originOf(req: IncomingMessage): string {
+function originOf(req: ForgeRequest): string {
   const host = req.headers.host ?? '127.0.0.1';
   if (host !== lastHost) {
     lastHost = host;

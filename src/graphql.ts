@@ -2,7 +2,7 @@
 // variables, aliases, arguments, fragments), a schema registry for the targeted __type probes,
 // and an executor over the shared forge store with Relay-style global ids.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './http-types.ts';
 import { OBJ_COMMIT, parseCommit, parseTree, serializeCommit } from './git/objects.ts';
 import { Forge, VIEWER, type ForgeRepo } from './store.ts';
 
@@ -747,8 +747,8 @@ function findPullByNumber(forge: Forge, number: number): { repo: ForgeRepo; pull
 // ---------------------------------------------------------------- the endpoint
 
 export interface GraphQLRequest {
-  req: IncomingMessage;
-  res: ServerResponse;
+  req: ForgeRequest;
+  res: ForgeResponse;
   body: Buffer;
   forge: Forge;
   token: string | null;

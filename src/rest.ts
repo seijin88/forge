@@ -2,7 +2,7 @@
 // (backed by the real git object store shared with the smart-HTTP surface), issues, labels,
 // comments, pull requests with squash merge, and the pagination/protocol contracts.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './http-types.ts';
 import {
   OBJ_BLOB, OBJ_COMMIT, OBJ_TREE, parseCommit,
   serializeCommit, serializeTree, parseTree, type TreeEntry,
@@ -46,7 +46,7 @@ function nodeIdOf(login: string): string {
   return nodeId;
 }
 
-export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+export function sendJson(res: ForgeResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -58,7 +58,7 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
 }
 
 /** Answer with a body that is already serialized (the hot path caches its bytes). */
-export function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer, headers?: Record<string, string>): void {
+export function sendJsonBuffer(res: ForgeResponse, status: number, body: Buffer, headers?: Record<string, string>): void {
   if (headers === undefined) {
     res.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
@@ -77,7 +77,7 @@ export function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer
 }
 
 export interface RestRequest {
-  req: IncomingMessage;
+  req: ForgeRequest;
   method: string;
   path: string; // under /api/v3, no trailing slash ("" for the root)
   query: URLSearchParams;
@@ -96,8 +96,8 @@ function parseBody(request: RestRequest): Record<string, unknown> | null {
   }
 }
 
-const notFound = (res: ServerResponse, message = 'Not Found'): void => sendJson(res, 404, { message });
-const badRequest = (res: ServerResponse, message = 'Problems parsing JSON'): void => sendJson(res, 400, { message });
+const notFound = (res: ForgeResponse, message = 'Not Found'): void => sendJson(res, 404, { message });
+const badRequest = (res: ForgeResponse, message = 'Problems parsing JSON'): void => sendJson(res, 400, { message });
 
 // ---------------------------------------------------------------- shapes
 
@@ -475,7 +475,7 @@ function pullRouteOf(suffix: string): PullRoute | null {
 
 // ---------------------------------------------------------------- the dispatcher
 
-export function handleRest(request: RestRequest, res: ServerResponse): void {
+export function handleRest(request: RestRequest, res: ForgeResponse): void {
   const { method, path, query, forge, token, baseUrl } = request;
 
   if (token === null) {
@@ -519,7 +519,7 @@ export function handleRest(request: RestRequest, res: ServerResponse): void {
 
 // ---------------------------------------------------------------- /user/repos
 
-function handleUserRepos(request: RestRequest, res: ServerResponse): void {
+function handleUserRepos(request: RestRequest, res: ForgeResponse): void {
   const { method, query, forge, baseUrl } = request;
   if (method === 'POST') {
     const body = parseBody(request);
@@ -563,7 +563,7 @@ function handleUserRepos(request: RestRequest, res: ServerResponse): void {
 
 // ---------------------------------------------------------------- /repos/{owner}/{name}/...
 
-function handleRepoRoutes(request: RestRequest, res: ServerResponse, owner: string, name: string, suffix: string): void {
+function handleRepoRoutes(request: RestRequest, res: ForgeResponse, owner: string, name: string, suffix: string): void {
   const { method, query, forge, baseUrl, token } = request;
   const repo = forge.getRepo(owner, name);
 
@@ -696,7 +696,7 @@ function resolveBranchOrSha(git: GitState, refish: string): string | null {
 
 // ---------------------------------------------------------------- contents
 
-function handleContents(request: RestRequest, res: ServerResponse, repo: ForgeRepo, filePath: string): void {
+function handleContents(request: RestRequest, res: ForgeResponse, repo: ForgeRepo, filePath: string): void {
   const { method, query, baseUrl, forge } = request;
   const git = repo.git;
   const segments = filePath.split('/').filter((segment) => segment.length > 0);
@@ -799,7 +799,7 @@ function handleContents(request: RestRequest, res: ServerResponse, repo: ForgeRe
 
 // ---------------------------------------------------------------- issues
 
-function handleIssues(request: RestRequest, res: ServerResponse, repo: ForgeRepo, numberRaw: string | null, comments: boolean): void {
+function handleIssues(request: RestRequest, res: ForgeResponse, repo: ForgeRepo, numberRaw: string | null, comments: boolean): void {
   const { method, query, baseUrl, forge } = request;
 
   if (numberRaw === null) {
@@ -909,7 +909,7 @@ function handleIssues(request: RestRequest, res: ServerResponse, repo: ForgeRepo
 
 // ---------------------------------------------------------------- pulls
 
-function handlePulls(request: RestRequest, res: ServerResponse, repo: ForgeRepo, numberRaw: string | null, action: string | null): void {
+function handlePulls(request: RestRequest, res: ForgeResponse, repo: ForgeRepo, numberRaw: string | null, action: string | null): void {
   const { method, query, baseUrl, forge } = request;
 
   if (numberRaw === null) {
