@@ -2,7 +2,7 @@
 // server/discover, legacy initialize handshake, a frozen six-tool registry, tools/call against
 // the shared forge store, and the exact error matrix (-32700/-32602/-32601, HTTP 400/401).
 
-import type { ForgeRequest, ForgeResponse } from './http-types.ts';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { OBJ_COMMIT, parseCommit, serializeCommit } from './git/objects.ts';
 import { Forge, VIEWER, type ForgeRepo } from './store.ts';
 
@@ -98,8 +98,8 @@ const TOOLS: ReadonlyArray<Record<string, unknown>> = Object.freeze([
 ]);
 
 export interface McpRequest {
-  req: ForgeRequest;
-  res: ForgeResponse;
+  req: IncomingMessage;
+  res: ServerResponse;
   body: Buffer;
   forge: Forge;
   token: string | null;
@@ -112,7 +112,7 @@ interface JsonRpcRequest {
   params?: Record<string, unknown>;
 }
 
-function writeJsonRpc(res: ForgeResponse, status: number, payload: Record<string, unknown>): void {
+function writeJsonRpc(res: ServerResponse, status: number, payload: Record<string, unknown>): void {
   const text = JSON.stringify(payload);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) });
   res.end(text);
